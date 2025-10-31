@@ -1,0 +1,400 @@
+name: "SAP CPI CI/CD Pipeline - DEV"
+
+on:
+  push:
+    paths:
+      - 'cpi-packages-dev.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  identify-cpi-packages:
+    name: "Identify CPI Packages for Deployment"
+    runs-on: ubuntu-latest
+    outputs:
+      package_matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v3
+
+      - name: "Parse CPI Package List"
+        id: set-matrix
+        run: |
+          echo "Reading 'cpi-packages-dev.yml' to extract package IDs..."
+          packages=$(yq e '.packages' cpi-packages-dev.yml | sed 's/- /"/g' | sed 's/$/"/' | paste -sd ',' -)
+          matrix_json="{\"include\":[ $(echo $packages | sed 's/,/},{\"package_id\":/g' | sed 's/^/{\"package_id\":/;s/$/}/') ]}"
+          echo "Package matrix prepared: $matrix_json"
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$matrix_json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  sync-cpi-artifacts-to-git:
+    name: "Syncing-Artifact - ${{ matrix.package_id }}"
+    needs: identify-cpi-packages
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.identify-cpi-packages.outputs.package_matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v3
+
+      - name: "Install Tools (jq, unzip)"
+        run: |
+          echo "Installing jq and unzip..."
+          sudo apt-get update && sudo apt-get install -y jq unzip
+
+      - name: "Authenticate: Get OAuth Token"
+        id: get_token
+        run: |
+          echo "Requesting OAuth token..."
+          response=$(curl -s -X POST "$OAUTH_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=$OAUTH_CLIENT_ID&client_secret=$OAUTH_CLIENT_SECRET")
+          echo "OAuth response: $response"
+          if echo "$response" | jq . >/dev/null 2>&1; then
+            token=$(echo "$response" | jq -r '.access_token')
+            if [ -z "$token" ] || [ "$token" == "null" ]; then
+              echo "Failed to retrieve OAuth token. Exiting."
+              exit 1
+            fi
+            echo "::add-mask::$token"
+            echo "access_token=$token" >> $GITHUB_OUTPUT
+            echo "OAuth token acquired."
+          else
+            echo "OAuth response is not valid JSON. Exiting."
+            exit 1
+          fi
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_TOKEN_URL: ${{ secrets.OAUTH_TOKEN_URL }}
+
+      - name: "Fetch Artifacts Metadata"
+        run: |
+          echo "Fetching artifact metadata for package '${{ matrix.package_id }}'..."
+          token="${{ steps.get_token.outputs.access_token }}"
+          curl -s -X GET "${{ secrets.CPI_API_BASE_URL }}/IntegrationPackages('${{ matrix.package_id }}')/IntegrationDesigntimeArtifacts" \
+            -H "Authorization: Bearer $token" -H "Accept: application/json" > artifacts.json
+          # Fail if .d.results doesn't exist to ensure job goes red in UI
+          if ! jq -e '.d.results' artifacts.json > /dev/null; then
+            echo "::error::Failed to get .d.results from artifacts.json for package '${{ matrix.package_id }}'"
+            cat artifacts.json
+            exit 1
+          fi
+          echo "Metadata fetched. $(jq '.d.results | length' artifacts.json) artifacts listed."
+
+      - name: "Download and Unpack Artifacts"
+        id: download
+        run: |
+          echo "Processing artifacts for package '${{ matrix.package_id }}'..."
+          set -euo pipefail
+          token="${{ steps.get_token.outputs.access_token }}"
+          pkg="${{ matrix.package_id }}"
+          changed=false
+
+          while read -r row; do
+            id=$(echo "$row" | jq -r '.Id')
+            ver=$(echo "$row" | jq -r '.Version')
+            echo "Artifact: $id (Version: $ver)"
+
+            if [[ "$ver" == "Active" ]]; then
+              echo "Resolving 'Active' version for $id..."
+              active_meta=$(curl -s -X GET "${{ secrets.CPI_API_BASE_URL }}/IntegrationDesigntimeArtifacts(Id='${id}',Version='Active')" \
+                -H "Authorization: Bearer $token" -H "Accept: application/json")
+              ver=$(echo "$active_meta" | jq -r '.d.Version')
+              echo "Resolved active version: $ver"
+            fi
+
+            base_dir="packages/$pkg/iflows/$id/$ver"
+            zip_path="$base_dir/${id}_${ver}.zip"
+            tmp_zip="temp_${id}_${ver}.zip"
+            tmp_unpack="tmp_unpack_${id}_${ver}"
+
+            mkdir -p "$base_dir"
+
+            echo "Downloading artifact $id v$ver..."
+            curl -s -X GET "${{ secrets.CPI_API_BASE_URL }}/IntegrationDesigntimeArtifacts(Id='${id}',Version='${ver}')/\$value" \
+              -H "Authorization: Bearer $token" -o "$tmp_zip"
+            echo "Artifact downloaded: $tmp_zip"
+
+            echo "Unpacking artifact zip..."
+            rm -rf "$tmp_unpack"
+            mkdir -p "$tmp_unpack"
+            unzip -qX "$tmp_zip" -d "$tmp_unpack"
+            echo "Unpacked to: $tmp_unpack"
+
+            compare_needed=false
+
+            if [[ -d "$base_dir" && -f "$zip_path" ]]; then
+              echo "Checking for changes in unpacked artifacts (excluding .prop files)..."
+
+              for item in "$tmp_unpack"/*; do
+                name=$(basename "$item")
+                if [[ -d "$item" ]]; then
+                  if ! diff -rq --exclude=*.prop "$base_dir/$name" "$item"; then
+                    echo "Directory changed: $name → Updating."
+                    rm -rf "$base_dir/$name"
+                    cp -r "$item" "$base_dir/"
+                    compare_needed=true
+                  else
+                    echo "Directory unchanged: $name"
+                  fi
+                elif [[ -f "$item" ]]; then
+                  if [[ "$name" == *.prop ]]; then
+                    echo "Ignoring .prop file $name for update trigger."
+                    continue
+                  fi
+                  if ! diff -q "$base_dir/$name" "$item"; then
+                    echo "File changed: $name → Updating."
+                    cp "$item" "$base_dir/"
+                    compare_needed=true
+                  else
+                    echo "File unchanged: $name"
+                  fi
+                fi
+              done
+
+              if $compare_needed; then
+                echo "Artifact content changed for $id v$ver. Updating zip and repo."
+                mv "$tmp_zip" "$zip_path"
+                changed=true
+                echo "{\"id\":\"$id\",\"version\":\"$ver\",\"package_id\":\"$pkg\"}" >> matrix_items.json
+              else
+                echo "No real changes detected for $id v$ver. Skipping update and removing downloaded zip."
+                rm "$tmp_zip"
+              fi
+
+            else
+              echo "🆕 New artifact version detected: $id v$ver. Copying all content."
+              mkdir -p "$base_dir"
+              mv "$tmp_zip" "$zip_path"
+              cp -r "$tmp_unpack"/. "$base_dir/"
+              changed=true
+              echo "{\"id\":\"$id\",\"version\":\"$ver\",\"package_id\":\"$pkg\"}" >> matrix_items.json
+            fi
+
+            rm -rf "$tmp_unpack"
+            echo "----------------------------------------------"
+          done < <(jq -c '.d.results[]' artifacts.json)
+
+          if [[ -f matrix_items.json ]]; then
+            jq -s '.' matrix_items.json > matrix_raw.json
+            rm matrix_items.json
+            echo "Updated matrix_raw.json generated."
+            tar -czf "artifact-changes-${pkg}.tar.gz" packages/${pkg}/iflows
+            echo "artifact_changes=artifact-changes-${pkg}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+          echo "changed=$changed" >> $GITHUB_ENV
+
+      - name: "Upload Artifact Matrix"
+        if: env.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.package_id }}
+          path: matrix_raw.json
+
+      - name: "Upload Artifact Changes"
+        if: env.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-changes-${{ matrix.package_id }}
+          path: artifact-changes-${{ matrix.package_id }}.tar.gz
+
+  commit-all-artifacts-to-git:
+    name: "Commit All Artifacts to Git"
+    needs: sync-cpi-artifacts-to-git
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v3
+
+      - name: "Download All Artifact Changes"
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: "Apply All Artifact Changes"
+        run: |
+          echo "Scanning for artifact-changes tarballs..."
+          shopt -s globstar
+          for tarball in all_artifacts/**/artifact-changes-*.tar.gz; do
+            if [[ -f "$tarball" ]]; then
+              echo "Extracting $tarball"
+              tar -xzf "$tarball" -C .
+            fi
+          done
+
+      - name: "Commit and Push Updated Artifacts Once"
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/
+          git commit -m "Sync CPI artifacts from all packages" || { echo "Nothing to commit."; exit 0; }
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt: Pulling and rebasing before push..."
+            git pull --rebase
+            if [ $? -eq 0 ]; then
+              echo "Rebase successful."
+              break
+            fi
+            echo "Rebase failed, attempt $attempt/$max_attempts. Retrying in 5s..."
+            sleep 5
+            attempt=$((attempt+1))
+          done
+          echo "Attempting to push..."
+          git push origin HEAD:${{ github.ref_name }} && exit 0
+          echo "Final push attempt failed. Please resolve conflicts manually."
+          exit 1
+
+  finalize-deployment-plan:
+    name: "Finalize Deployment Plan"
+    needs: commit-all-artifacts-to-git
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_matrix: ${{ steps.merge.outputs.artifact_matrix }}
+    steps:
+      - name: "Download All Artifact Matrices"
+        uses: actions/download-artifact@v4
+        with:
+          path: matrices
+
+      - name: "Merge Artifact Matrices"
+        id: merge
+        run: |
+          echo "Merging artifact matrices from all packages..."
+
+          if [[ ! -d "matrices" ]]; then
+            echo "No 'matrices/' directory found. No artifact changes detected."
+            echo "artifact_matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          merged="[]"
+          found=false
+          for file in $(find matrices -name matrix_raw.json); do
+            found=true
+            echo "Found artifact matrix: $file"
+            content=$(cat "$file")
+            merged=$(jq -s 'add' <<< "$(echo "$merged"; echo "$content")")
+          done
+
+          if [[ "$found" == false ]]; then
+            echo "No matrix files found in 'matrices/'. Skipping deployment."
+            echo "artifact_matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Final merged matrix: $merged"
+          echo "artifact_matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$merged" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  skip-deployment:
+    name: "Skip Deployment (No Changes)"
+    needs: finalize-deployment-plan
+    if: always() && needs.finalize-deployment-plan.outputs.artifact_matrix == '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: "No Artifacts to Deploy"
+        run: echo "No new changes detected. Skipping deployment stage."
+
+  deploy-to-development:
+    name: "Deploy ${{ matrix.package_id }} / ${{ matrix.id }} / ${{ matrix.version }}"
+    needs: finalize-deployment-plan
+    if: >
+      always() && needs.finalize-deployment-plan.outputs.artifact_matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.finalize-deployment-plan.outputs.artifact_matrix) }}
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v3
+
+      - name: "Authenticate: Get OAuth Token"
+        id: get_token
+        run: |
+          echo "Fetching OAuth token for deployment..."
+          response=$(curl -s -X POST "$OAUTH_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=$OAUTH_CLIENT_ID&client_secret=$OAUTH_CLIENT_SECRET")
+          echo "OAuth response: $response"
+          if echo "$response" | jq . >/dev/null 2>&1; then
+            token=$(echo "$response" | jq -r '.access_token')
+            if [ -z "$token" ] || [ "$token" == "null" ]; then
+              echo "Failed to retrieve OAuth token. Exiting."
+              exit 1
+            fi
+            echo "::add-mask::$token"
+            echo "access_token=$token" >> $GITHUB_OUTPUT
+            echo "OAuth token acquired."
+          else
+            echo "OAuth response is not valid JSON. Exiting."
+            exit 1
+          fi
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_TOKEN_URL: ${{ secrets.OAUTH_TOKEN_URL }}
+
+      - name: "Trigger Artifact Deployment"
+        run: |
+          id="${{ matrix.id }}"
+          version="${{ matrix.version }}"
+          pkg="${{ matrix.package_id }}"
+          token="${{ steps.get_token.outputs.access_token }}"
+
+          echo "Deploying $id v$version (Package: $pkg) to DEV..."
+          deploy_response=$(curl -s -w "%{http_code}" -o response.txt -X POST "${{ secrets.CPI_API_BASE_URL }}/DeployIntegrationDesigntimeArtifact?Id='${id}'&Version='${version}'" \
+            -H "Authorization: Bearer $token" -H "Accept: application/json")
+
+          status_code="${deploy_response:(-3)}"
+          task_id=$(cat response.txt)
+
+          echo "Deployment trigger HTTP status: $status_code"
+          echo "Deployment task ID: $task_id"
+
+          if [[ "$status_code" -ne 202 || -z "$task_id" ]]; then
+            echo "Deployment API did not return valid task ID"
+            exit 1
+          fi
+
+          for attempt in {1..10}; do
+            echo "Checking deployment status (attempt $attempt)..."
+            status=$(curl -s -X GET "${{ secrets.CPI_API_BASE_URL }}/BuildAndDeployStatus(TaskId='${task_id}')" \
+              -H "Authorization: Bearer $token" -H "Accept: application/json" \
+              | jq -r '.d.Status // empty')
+
+            echo "Deployment Status: $status"
+
+            if [[ "$status" == "SUCCESS" ]]; then
+              echo "$id v$version deployed successfully."
+              break
+            elif [[ "$status" == "FAIL" ]]; then
+              echo "Deployment failed for $id"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "Verifying runtime status for $id..."
+          rt=$(curl -s -X GET "${{ secrets.CPI_API_BASE_URL }}/IntegrationRuntimeArtifacts('${id}')" \
+            -H "Authorization: Bearer $token" -H "Accept: application/json" \
+            | jq -r '.d.Status // empty')
+
+          echo "Runtime status: $rt"
+          if [[ "$rt" != "STARTED" ]]; then
+            echo "$id did not start correctly"
+            exit 1
+          fi
+
+          echo "$id is successfully deployed and running in DEV!"
